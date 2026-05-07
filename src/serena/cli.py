@@ -127,6 +127,147 @@ class ProjectType(click.ParamType):
 PROJECT_TYPE = ProjectType()
 
 
+def _tool_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _tool_make_envelope(
+    *,
+    ok: bool,
+    tool: str | None,
+    project: str | None,
+    elapsed_ms: int,
+    truncated: bool,
+    result: Any = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "tool": tool,
+        "project": project,
+        "elapsed_ms": elapsed_ms,
+        "truncated": truncated,
+        "result": result,
+        "error": error,
+    }
+
+
+def _tool_emit_envelope(envelope: dict[str, Any]) -> None:
+    # 中文说明：JSON 结果必须走 stdout，便于 agent 稳定解析。
+    click.echo(_tool_json_dumps(envelope))
+
+
+def _tool_truncate_payload(payload: Any, max_chars: int | None) -> tuple[Any, bool]:
+    if max_chars is None:
+        return payload, False
+    if max_chars <= 0:
+        raise ValueError("max-chars must be a positive integer")
+    payload_text = _tool_json_dumps(payload)
+    if len(payload_text) <= max_chars:
+        return payload, False
+    return payload_text[:max_chars], True
+
+
+def _tool_load_json_args(json_args: str | None, json_file: str | None, stdin_json: bool) -> dict[str, Any]:
+    provided = int(bool(json_args)) + int(bool(json_file)) + int(bool(stdin_json))
+    if provided > 1:
+        raise ValueError("Pass at most one of --json-args, --json-file, or --stdin-json.")
+
+    if json_args is not None:
+        raw = json_args
+    elif json_file is not None:
+        with open(json_file, encoding="utf-8") as f:
+            raw = f.read()
+    elif stdin_json:
+        raw = sys.stdin.read()
+    else:
+        raw = "{}"
+
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValueError(f"Tool arguments must be a JSON object, got {type(data).__name__}.")
+    return data
+
+
+def _tool_parse_result(raw_result: str) -> Any:
+    try:
+        return json.loads(raw_result)
+    except Exception:
+        return raw_result
+
+
+def _tool_is_shell_tool(tool_name: str) -> bool:
+    # 中文说明：当前 shell 工具名 + 轻量规则兜底，避免未来 shell 类工具漏判。
+    return tool_name == "execute_shell_command" or tool_name.endswith("shell") or "shell" in tool_name
+
+
+def _tool_is_obvious_write_tool(tool_name: str) -> bool:
+    # 中文说明：对未标注 ToolMarkerCanEdit 但语义明显可变更状态的工具进行额外拦截。
+    write_prefixes = (
+        "write_",
+        "create_",
+        "delete_",
+        "remove_",
+        "rename_",
+        "edit_",
+        "replace_",
+        "insert_",
+    )
+    write_like_exact_names = {
+        "activate_project",
+        "restart_language_server",
+        "safe_delete_symbol",
+        "jet_brains_move",
+        "jet_brains_safe_delete",
+        "jet_brains_rename",
+        "jet_brains_inline_symbol",
+        "open_dashboard",
+    }
+    return tool_name.startswith(write_prefixes) or tool_name in write_like_exact_names
+
+
+def _tool_security_error(tool_name: str, tool_class: type[Any], allow_write: bool, allow_shell: bool) -> str | None:
+    missing_flags: list[str] = []
+    if (tool_class.can_edit() or _tool_is_obvious_write_tool(tool_name)) and not allow_write:
+        missing_flags.append("--allow-write")
+    if _tool_is_shell_tool(tool_name) and not allow_shell:
+        missing_flags.append("--allow-shell")
+    if not missing_flags:
+        return None
+    return f"Tool '{tool_name}' is blocked by policy. Missing required flag(s): {', '.join(missing_flags)}"
+
+
+def _create_tool_cli_agent(project: str | None):
+    from serena.agent import SerenaAgent
+    from serena.config.serena_config import SerenaConfig
+    from serena.project import Project
+    from serena.tools import ToolRegistry
+
+    # 中文说明：加载常规配置，但断开 config 保存路径，避免 CLI run 改写全局配置。
+    serena_config = SerenaConfig.from_config_file()
+    serena_config._config_file_path = None
+    serena_config.web_dashboard = False
+    serena_config.gui_log_window = False
+    serena_config.web_dashboard_open_on_launch = False
+    serena_config.included_optional_tools = tuple(ToolRegistry().get_tool_names_optional())
+
+    agent = SerenaAgent(project=None, serena_config=serena_config)
+    if project is None:
+        return agent
+
+    registered_project = serena_config.get_registered_project(project, autoregister=False)
+    if registered_project is not None:
+        agent._activate_project(registered_project.get_project_instance(serena_config))
+        return agent
+
+    if os.path.isdir(project):
+        project_instance = Project.load(project, serena_config=serena_config, autogenerate=False)
+        agent._activate_project(project_instance)
+        return agent
+
+    raise ValueError(f"Project '{project}' not found. Pass a registered project name or an existing project path.")
+
+
 class TopLevelCommands(AutoRegisteringGroup):
     """Root CLI group containing the core Serena commands."""
 
@@ -1113,6 +1254,235 @@ class ToolCommands(AutoRegisteringGroup):
         click.echo(mcp_tool.description)
 
 
+class AgentFriendlyToolCommands(AutoRegisteringGroup):
+    """Group for agent-friendly JSON tool execution commands."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="tool",
+            help="Agent-friendly Serena tool commands (`list`, `schema`, `run`) with JSON envelopes.",
+        )
+
+    @staticmethod
+    @click.command("list", help="List all registered Serena tools.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
+    @click.option("--json", "_json", is_flag=True, help="Output JSON (kept for explicitness; output is JSON by default).")
+    @click.option("--max-chars", type=int, default=None, help="Truncate result payload to at most N characters.")
+    def list(_json: bool, max_chars: int | None) -> None:
+        from serena.tools import ToolMarkerBeta, ToolMarkerDoesNotRequireActiveProject, ToolRegistry
+
+        start_time = time.perf_counter()
+        try:
+            registry = ToolRegistry()
+            optional_tool_names = set(registry.get_tool_names_optional())
+            result = []
+            for tool_name in sorted(registry.get_tool_names()):
+                tool_class = registry.get_tool_class_by_name(tool_name)
+                result.append(
+                    {
+                        "name": tool_name,
+                        "module": tool_class.__module__,
+                        "optional": tool_name in optional_tool_names,
+                        "beta": issubclass(tool_class, ToolMarkerBeta),
+                        "can_edit": tool_class.can_edit(),
+                        "requires_active_project": not issubclass(tool_class, ToolMarkerDoesNotRequireActiveProject),
+                        "is_shell_tool": _tool_is_shell_tool(tool_name),
+                        "requires_allow_write": tool_class.can_edit() or _tool_is_obvious_write_tool(tool_name),
+                        "requires_allow_shell": _tool_is_shell_tool(tool_name),
+                    }
+                )
+            truncated_result, truncated = _tool_truncate_payload(result, max_chars)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=True,
+                    tool=None,
+                    project=None,
+                    elapsed_ms=elapsed_ms,
+                    truncated=truncated,
+                    result=truncated_result,
+                    error=None,
+                )
+            )
+        except Exception as e:
+            click.echo(f"tool list failed: {e}", err=True)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=False,
+                    tool=None,
+                    project=None,
+                    elapsed_ms=elapsed_ms,
+                    truncated=False,
+                    result=None,
+                    error=str(e),
+                )
+            )
+            raise SystemExit(1)
+
+    @staticmethod
+    @click.command("schema", help="Show JSON schema for a Serena tool.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
+    @click.argument("tool_name", type=str)
+    @click.option("--json", "_json", is_flag=True, help="Output JSON (kept for explicitness; output is JSON by default).")
+    @click.option("--max-chars", type=int, default=None, help="Truncate result payload to at most N characters.")
+    def schema(tool_name: str, _json: bool, max_chars: int | None) -> None:
+        from serena.tools import ToolMarkerDoesNotRequireActiveProject, ToolRegistry
+
+        start_time = time.perf_counter()
+        try:
+            registry = ToolRegistry()
+            tool_class = registry.get_tool_class_by_name(tool_name)
+            optional_tool_names = set(registry.get_tool_names_optional())
+            result = {
+                "name": tool_name,
+                "module": tool_class.__module__,
+                "description": tool_class.get_apply_docstring_from_cls(),
+                "parameters": tool_class.get_apply_fn_metadata_from_cls().arg_model.model_json_schema(),
+                "optional": tool_name in optional_tool_names,
+                "can_edit": tool_class.can_edit(),
+                "requires_active_project": not issubclass(tool_class, ToolMarkerDoesNotRequireActiveProject),
+                "is_shell_tool": _tool_is_shell_tool(tool_name),
+                "requires_allow_write": tool_class.can_edit() or _tool_is_obvious_write_tool(tool_name),
+                "requires_allow_shell": _tool_is_shell_tool(tool_name),
+            }
+            truncated_result, truncated = _tool_truncate_payload(result, max_chars)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=True,
+                    tool=tool_name,
+                    project=None,
+                    elapsed_ms=elapsed_ms,
+                    truncated=truncated,
+                    result=truncated_result,
+                    error=None,
+                )
+            )
+        except Exception as e:
+            click.echo(f"tool schema failed: {e}", err=True)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=False,
+                    tool=tool_name,
+                    project=None,
+                    elapsed_ms=elapsed_ms,
+                    truncated=False,
+                    result=None,
+                    error=str(e),
+                )
+            )
+            raise SystemExit(1)
+
+    @staticmethod
+    @click.command("run", help="Run a Serena tool with JSON arguments.", context_settings={"max_content_width": _MAX_CONTENT_WIDTH})
+    @click.argument("tool_name", type=str)
+    @click.option("--project", type=PROJECT_TYPE, default=None, help="Absolute project path or registered project name.")
+    @click.option("--json-args", type=str, default=None, help="Inline JSON object with tool arguments.")
+    @click.option("--json-file", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to JSON args file.")
+    @click.option("--stdin-json", is_flag=True, default=False, help="Read JSON args object from stdin.")
+    @click.option("--allow-write", is_flag=True, default=False, help="Allow edit/write tools (ToolMarkerCanEdit).")
+    @click.option("--allow-shell", is_flag=True, default=False, help="Allow shell execution tools.")
+    @click.option("--json", "_json", is_flag=True, help="Output JSON (kept for explicitness; output is JSON by default).")
+    @click.option("--max-chars", type=int, default=None, help="Truncate result payload to at most N characters.")
+    def run(
+        tool_name: str,
+        project: str | None,
+        json_args: str | None,
+        json_file: str | None,
+        stdin_json: bool,
+        allow_write: bool,
+        allow_shell: bool,
+        _json: bool,
+        max_chars: int | None,
+    ) -> None:
+        from serena.tools import ToolRegistry
+
+        start_time = time.perf_counter()
+        agent = None
+        try:
+            args_dict = _tool_load_json_args(json_args=json_args, json_file=json_file, stdin_json=stdin_json)
+
+            registry = ToolRegistry()
+            tool_class = registry.get_tool_class_by_name(tool_name)
+            if security_error := _tool_security_error(tool_name, tool_class, allow_write=allow_write, allow_shell=allow_shell):
+                elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+                _tool_emit_envelope(
+                    _tool_make_envelope(
+                        ok=False,
+                        tool=tool_name,
+                        project=project,
+                        elapsed_ms=elapsed_ms,
+                        truncated=False,
+                        result=None,
+                        error=security_error,
+                    )
+                )
+                raise SystemExit(1)
+
+            agent = _create_tool_cli_agent(project)
+            active_project = agent.get_active_project()
+            project_for_envelope = active_project.project_root if active_project is not None else project
+            tool = agent.get_tool_by_name(tool_name)
+            raw_result = tool.apply_ex(log_call=False, catch_exceptions=True, **args_dict)
+
+            parsed_result = _tool_parse_result(raw_result)
+            truncated_result, truncated = _tool_truncate_payload(parsed_result, max_chars)
+
+            tool_error = None
+            if isinstance(parsed_result, str) and parsed_result.startswith("Error"):
+                tool_error = parsed_result
+
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            if tool_error is not None:
+                _tool_emit_envelope(
+                    _tool_make_envelope(
+                        ok=False,
+                        tool=tool_name,
+                        project=project_for_envelope,
+                        elapsed_ms=elapsed_ms,
+                        truncated=truncated,
+                        result=None,
+                        error=tool_error,
+                    )
+                )
+                raise SystemExit(1)
+
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=True,
+                    tool=tool_name,
+                    project=project_for_envelope,
+                    elapsed_ms=elapsed_ms,
+                    truncated=truncated,
+                    result=truncated_result,
+                    error=None,
+                )
+            )
+        except SystemExit:
+            raise
+        except Exception as e:
+            click.echo(f"tool run failed: {e}", err=True)
+            elapsed_ms = int((time.perf_counter() - start_time) * 1000)
+            _tool_emit_envelope(
+                _tool_make_envelope(
+                    ok=False,
+                    tool=tool_name,
+                    project=project,
+                    elapsed_ms=elapsed_ms,
+                    truncated=False,
+                    result=None,
+                    error=str(e),
+                )
+            )
+            raise SystemExit(1)
+        finally:
+            if agent is not None:
+                try:
+                    agent.on_shutdown(timeout=1.0)
+                except Exception as shutdown_error:
+                    click.echo(f"tool run cleanup warning: {shutdown_error}", err=True)
+
+
 class PromptCommands(AutoRegisteringGroup):
     def __init__(self) -> None:
         super().__init__(name="prompts", help="Commands related to Serena's prompts that are outside of contexts and modes.")
@@ -1243,11 +1613,12 @@ _context = ContextCommands()
 _project = ProjectCommands()
 _config = SerenaConfigCommands()
 _tools = ToolCommands()
+_tool = AgentFriendlyToolCommands()
 _prompts = PromptCommands()
 
 # Expose so we can use this as an entrypoint
 top_level = TopLevelCommands()
 
 # needed for the help script to work - register all subcommands to the top-level group
-for subgroup in (_mode, _context, _project, _config, _tools, _prompts):
+for subgroup in (_mode, _context, _project, _config, _tools, _tool, _prompts):
     top_level.add_command(subgroup)
