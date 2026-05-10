@@ -1,6 +1,7 @@
 import collections
 import glob
 import json
+from pathlib import PurePosixPath
 import os
 import shutil
 import subprocess
@@ -187,6 +188,135 @@ def _tool_load_json_args(json_args: str | None, json_file: str | None, stdin_jso
     if not isinstance(data, dict):
         raise ValueError(f"Tool arguments must be a JSON object, got {type(data).__name__}.")
     return data
+
+
+def _tool_parse_language_values(language: str | None, languages: str | None) -> list[Language]:
+    if language is None and languages is None:
+        return []
+
+    lang_aliases = {
+        "javascript": "typescript",
+    }
+
+    raw_values: list[str] = []
+    if language is not None:
+        raw_values.append(language)
+    if languages is not None:
+        raw_values.extend(part.strip() for part in languages.split(","))
+
+    resolved: list[Language] = []
+    for raw_value in raw_values:
+        if not raw_value:
+            continue
+        normalized = lang_aliases.get(raw_value.strip().lower(), raw_value.strip().lower())
+        try:
+            lang = Language(normalized)
+        except ValueError as e:
+            valid = ", ".join(sorted(l.value for l in Language))
+            raise ValueError(f"Invalid language '{raw_value}'. Valid values: {valid}") from e
+        if lang not in resolved:
+            resolved.append(lang)
+    return resolved
+
+
+def _tool_infer_languages_from_args(args_dict: dict[str, Any]) -> list[Language]:
+    path_values: list[str] = []
+    for key in ("relative_path", "path"):
+        value = args_dict.get(key)
+        if isinstance(value, str) and value.strip():
+            path_values.append(value.strip())
+
+    extension_language_hints = {
+        ".ts": Language.TYPESCRIPT,
+        ".tsx": Language.TYPESCRIPT,
+        ".js": Language.TYPESCRIPT,
+        ".jsx": Language.TYPESCRIPT,
+        ".mjs": Language.TYPESCRIPT,
+        ".cjs": Language.TYPESCRIPT,
+        ".mts": Language.TYPESCRIPT,
+        ".cts": Language.TYPESCRIPT,
+    }
+
+    inferred: list[Language] = []
+    for candidate_path in path_values:
+        # 中文说明：优先按后缀做稳定映射，避免 `.ts` 被误判到 `dart` 等语言。
+        normalized_path = candidate_path.replace("\\", "/")
+        suffix = PurePosixPath(normalized_path).suffix.lower()
+        hinted_language = extension_language_hints.get(suffix)
+        if hinted_language is not None:
+            if hinted_language not in inferred:
+                inferred.append(hinted_language)
+            continue
+
+        matching_languages: list[Language] = []
+        for language in Language.iter_all(include_experimental=True, include_non_programming_languages=True):
+            if language.get_source_fn_matcher().string_contains_relevant_filename(candidate_path):
+                matching_languages.append(language)
+
+        if not matching_languages:
+            continue
+
+        best_priority = max(lang.get_priority() for lang in matching_languages)
+        best_candidates = sorted((lang for lang in matching_languages if lang.get_priority() == best_priority), key=lambda lang: lang.value)
+        best = best_candidates[0]
+        if best not in inferred:
+            inferred.append(best)
+
+    return inferred
+
+
+def _tool_resolve_effective_languages(
+    configured_languages: list[Language],
+    *,
+    language: str | None,
+    languages: str | None,
+    auto_language_from_path: bool,
+    args_dict: dict[str, Any],
+) -> list[Language]:
+    explicit_languages = _tool_parse_language_values(language=language, languages=languages)
+    inferred_languages = _tool_infer_languages_from_args(args_dict) if auto_language_from_path else []
+
+    effective_languages = list(explicit_languages) if explicit_languages else list(configured_languages)
+    for inferred_language in inferred_languages:
+        if inferred_language not in effective_languages:
+            effective_languages.append(inferred_language)
+    return effective_languages
+
+
+def _tool_apply_runtime_language_override(
+    agent: Any,
+    *,
+    tool_name: str,
+    args_dict: dict[str, Any],
+    language: str | None,
+    languages: str | None,
+    auto_language_from_path: bool,
+) -> None:
+    if language is None and languages is None and not auto_language_from_path:
+        return
+
+    active_project = agent.get_active_project()
+    if active_project is None:
+        raise ValueError("Language override requires an active project. Pass --project <path_or_name>.")
+
+    current_languages = list(active_project.project_config.languages)
+    effective_languages = _tool_resolve_effective_languages(
+        current_languages,
+        language=language,
+        languages=languages,
+        auto_language_from_path=auto_language_from_path,
+        args_dict=args_dict,
+    )
+
+    if effective_languages == current_languages:
+        return
+
+    # 中文说明：仅在当前 CLI 调用内存中覆盖语言配置，禁止落盘写回 project.yml。
+    active_project.project_config.languages = effective_languages
+
+    if agent.get_language_backend().is_lsp():
+        # 中文说明：重建 LS 管理器使临时语言覆盖立即生效。
+        agent.execute_task(lambda: agent.reset_language_server_manager(), name=f"ToolRunLanguageOverride:{tool_name}", logged=False)
 
 
 def _tool_parse_result(raw_result: str) -> Any:
@@ -1380,6 +1510,19 @@ class AgentFriendlyToolCommands(AutoRegisteringGroup):
     @click.option("--json-args", type=str, default=None, help="Inline JSON object with tool arguments.")
     @click.option("--json-file", type=click.Path(exists=True, dir_okay=False), default=None, help="Path to JSON args file.")
     @click.option("--stdin-json", is_flag=True, default=False, help="Read JSON args object from stdin.")
+    @click.option("--language", type=str, default=None, help="Temporarily override active project language for this call.")
+    @click.option(
+        "--languages",
+        type=str,
+        default=None,
+        help="Temporarily override active project languages for this call (comma-separated).",
+    )
+    @click.option(
+        "--auto-language-from-path",
+        is_flag=True,
+        default=False,
+        help="Infer language from json args path/relative_path suffix and add for this call.",
+    )
     @click.option("--allow-write", is_flag=True, default=False, help="Allow edit/write tools (ToolMarkerCanEdit).")
     @click.option("--allow-shell", is_flag=True, default=False, help="Allow shell execution tools.")
     @click.option("--json", "_json", is_flag=True, help="Output JSON (kept for explicitness; output is JSON by default).")
@@ -1390,6 +1533,9 @@ class AgentFriendlyToolCommands(AutoRegisteringGroup):
         json_args: str | None,
         json_file: str | None,
         stdin_json: bool,
+        language: str | None,
+        languages: str | None,
+        auto_language_from_path: bool,
         allow_write: bool,
         allow_shell: bool,
         _json: bool,
@@ -1420,6 +1566,18 @@ class AgentFriendlyToolCommands(AutoRegisteringGroup):
                 raise SystemExit(1)
 
             agent = _create_tool_cli_agent(project)
+            active_project = agent.get_active_project()
+            project_for_envelope = active_project.project_root if active_project is not None else project
+
+            _tool_apply_runtime_language_override(
+                agent,
+                tool_name=tool_name,
+                args_dict=args_dict,
+                language=language,
+                languages=languages,
+                auto_language_from_path=auto_language_from_path,
+            )
+
             active_project = agent.get_active_project()
             project_for_envelope = active_project.project_root if active_project is not None else project
             tool = agent.get_tool_by_name(tool_name)
