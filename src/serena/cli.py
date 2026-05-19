@@ -1387,7 +1387,6 @@ class ToolCommands(AutoRegisteringGroup):
         click.echo(mcp_tool.description)
 
 
-<<<<<<< HEAD
 class AgentFriendlyToolCommands(AutoRegisteringGroup):
     """Group for agent-friendly JSON tool execution commands."""
 
@@ -1643,7 +1642,6 @@ class AgentFriendlyToolCommands(AutoRegisteringGroup):
                     agent.on_shutdown(timeout=1.0)
                 except Exception as shutdown_error:
                     click.echo(f"tool run cleanup warning: {shutdown_error}", err=True)
-=======
 class MemoryCommands(AutoRegisteringGroup):
     """Group for 'memories' subcommands; manage and inspect a project's memory files."""
 
@@ -1918,7 +1916,6 @@ class MemoryCommands(AutoRegisteringGroup):
             dry_run=dry_run,
         )
         click.echo(report.format())
->>>>>>> ffd5dfd3e7088faaedf0855a5053a083c3bb97fa
 
 
 class PromptCommands(AutoRegisteringGroup):
@@ -2059,9 +2056,5 @@ _memories = MemoryCommands()
 top_level = TopLevelCommands()
 
 # needed for the help script to work - register all subcommands to the top-level group
-<<<<<<< HEAD
-for subgroup in (_mode, _context, _project, _config, _tools, _tool, _prompts):
-=======
-for subgroup in (_mode, _context, _project, _config, _tools, _prompts, _memories):
->>>>>>> ffd5dfd3e7088faaedf0855a5053a083c3bb97fa
+for subgroup in (_mode, _context, _project, _config, _tools, _tool, _prompts, _memories):
     top_level.add_command(subgroup)
